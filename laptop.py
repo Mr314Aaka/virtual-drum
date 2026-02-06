@@ -4,14 +4,18 @@ import serial
 import threading
 import time
 import sys
+import queue 
 
 # --- CONFIGURATION ---
 SAMPLE_RATE = 44100
 WIDTH, HEIGHT = 800, 400
-SERIAL_PORT = '/dev/ttyUSB0' # Ensure this matches your Receiver port
+SERIAL_PORT = '/dev/ttyUSB0' # CHECK THIS!
 BAUD_RATE = 115200
 
-# --- SOUND ENGINE GENERATORS ---
+# --- QUEUE FOR THREAD SAFETY ---
+sound_queue = queue.Queue()
+
+# --- HIGH QUALITY SOUND GENERATORS ---
 
 def generate_punchy_snare():
     """Synthesizes a high-impact Snare with a 'Pop' transient and high-pass noise."""
@@ -35,10 +39,12 @@ def generate_punchy_snare():
 
     # Mix: 40% Shell, 20% Snap, 40% Wires
     combined = (pop * 0.4) + (snap * 0.2) + (sizzle * 0.4)
-    combined = np.tanh(combined * 1.5) # Soft saturation for grit
-
-    final_sound = combined / (np.max(np.abs(combined)) + 1e-6)
-    return (final_sound * 32767 * 1.4).astype(np.int16)
+    combined = np.tanh(combined * 1.5) # Soft saturation
+    
+    # Normalize
+    max_val = np.max(np.abs(combined))
+    if max_val == 0: return np.zeros(n_samples, dtype=np.int16)
+    return (combined / max_val * 32767 * 0.9).astype(np.int16)
 
 def generate_pro_kick():
     """Deep membrane thump for the Kick drum."""
@@ -53,32 +59,57 @@ def generate_pro_kick():
         buf.pop(0); buf.append(avg * 0.995)
     
     final = np.convolve(raw, np.ones(120)/120, mode='same')
-    final = final / (np.max(np.abs(final)) + 1e-6)
-    return (final * 32767 * 1.8).astype(np.int16)
+    
+    max_val = np.max(np.abs(final))
+    if max_val == 0: return np.zeros(length, dtype=np.int16)
+    return (final / max_val * 32767 * 0.95).astype(np.int16)
 
 def generate_pro_closed_hat():
-    """Tight metallic 'Tad' chirp."""
+    """Acoustic Closed Hat - Tight metallic 'tick'"""
     duration = 0.08
-    n_samples = int(44100 * duration)
-    buffer_lengths = [31, 41, 67]
-    combined = np.zeros(n_samples, dtype=np.float32)
-    for b_len in buffer_lengths:
-        ring_buf = list(np.random.uniform(-1, 1, b_len))
-        layer = np.zeros(n_samples)
-        for j in range(n_samples):
-            layer[j] = ring_buf[0]
-            new_val = -ring_buf[0] * 0.92 
-            ring_buf.pop(0); ring_buf.append(new_val)
-        combined += layer * 0.33
-    final = np.zeros(n_samples)
+    n_samples = int(SAMPLE_RATE * duration)
+    t = np.linspace(0, duration, n_samples)
+    
+    # Metallic Cluster (9-11 kHz)
+    metallic_freqs = [(9400, 0.35), (9700, 0.40), (10100, 0.50), (10400, 0.45), (10700, 0.38), (11200, 0.25)]
+    metal = np.zeros(n_samples, dtype=np.float32)
+    for freq, amp in metallic_freqs:
+        detune = 1.0 + np.random.uniform(-0.002, 0.002)
+        phase = np.random.uniform(0, 2 * np.pi)
+        metal += amp * np.sin(2 * np.pi * freq * detune * t + phase)
+    
+    # Filtered Noise
+    noise = np.random.uniform(-1, 1, n_samples).astype(np.float32)
+    hp_noise = np.zeros(n_samples)
     for i in range(1, n_samples):
-        final[i] = (combined[i] - combined[i-1]) * np.exp(-20 * (i/44100))
-    return (final / (np.max(np.abs(final)) + 1e-6) * 32767 * 1.2).astype(np.int16)
+        hp_noise[i] = noise[i] - 0.75 * noise[i - 1]
+    
+    # Transient Click
+    click_len = 80
+    click = np.zeros(n_samples)
+    click_env = np.exp(-np.linspace(0, 10, click_len))
+    click[:click_len] = np.random.uniform(-1, 1, click_len) * click_env
+    
+    # Envelope
+    envelope = np.exp(-400 * t) * 0.85 + np.exp(-60 * t) * 0.15
+    
+    # Mix
+    combined = (metal * 0.50 + hp_noise * 0.25 + click * 0.40) * envelope
+    
+    # High Pass Clean & Saturation
+    hp = np.zeros(n_samples)
+    for i in range(1, n_samples):
+        hp[i] = combined[i] - 0.985 * combined[i - 1]
+    hp = np.tanh(hp * 1.4)
+    
+    max_val = np.max(np.abs(hp))
+    if max_val == 0: return np.zeros(n_samples, dtype=np.int16)
+    return (hp / max_val * 32767 * 0.8).astype(np.int16)
 
 def generate_pro_open_hat():
     """Shimmering 'Dhus' metallic wash."""
-    duration = 0.8
-    n_samples = int(44100 * duration)
+    duration = 0.6 # Slightly shorter for better feel
+    n_samples = int(SAMPLE_RATE * duration)
     t = np.linspace(0, duration, n_samples)
     buffer_lengths = [31, 47, 61, 89, 113]
     combined = np.zeros(n_samples, dtype=np.float32)
@@ -90,82 +121,114 @@ def generate_pro_open_hat():
             new_val = -ring_buf[0] * 0.996
             ring_buf.pop(0); ring_buf.append(new_val)
         combined += layer * 0.2
+    
     out = np.zeros(n_samples)
     shimmer = 1.0 + 0.2 * np.sin(2 * np.pi * 10 * t)
     for i in range(1, n_samples):
         out[i] = (combined[i] - 0.9 * combined[i-1]) * np.exp(-6 * t[i]) * shimmer[i]
-    return (out / (np.max(np.abs(out)) + 1e-6) * 32767 * 1.3).astype(np.int16)
+        
+    max_val = np.max(np.abs(out))
+    if max_val == 0: return np.zeros(n_samples, dtype=np.int16)
+    return (out / max_val * 32767 * 0.8).astype(np.int16)
 
-# --- INITIALIZATION ---
-pygame.mixer.pre_init(SAMPLE_RATE, -16, 1, 512)
+# --- INIT ---
+# Increased buffer to 2048 to prevent Linux audio silence/glitches
+pygame.mixer.pre_init(SAMPLE_RATE, -16, 1, 2048)
 pygame.init()
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Air Drum Engine - Pro Snare Update")
+pygame.display.set_caption("Air Drums: Pro Engine")
+font = pygame.font.SysFont('Arial', 24)
 
-print("Synthesizing Kit...")
-raw_sounds = {
-    1: (generate_punchy_snare(), (80, 255, 150), "SNARE"),
-    2: (generate_pro_kick(), (255, 80, 80), "KICK"),
-    3: (generate_pro_closed_hat(), (255, 255, 100), "CLOSED HAT"),
-    4: (generate_pro_open_hat(), (255, 200, 0), "OPEN HAT")
+# Kit Mapping
+print("Synthesizing PRO Sounds... please wait.")
+# Mode 0: Snare (ID 2) & Kick (ID 1)
+# Mode 1: Closed Hat (ID 2) & Open Hat (ID 1)
+kits = {
+    0: {2: (generate_punchy_snare(), (80,255,150), "SNARE"), 1: (generate_pro_kick(), (255,80,80), "KICK")},
+    1: {2: (generate_pro_closed_hat(), (255,255,100), "CH"), 1: (generate_pro_open_hat(), (255,200,0), "OH")}
 }
+print("Sounds ready!")
 
-current_wf = np.zeros(1000)
-wf_color = (100, 100, 100)
-label_text = "Waiting for Sticks..."
-open_hat_channel = None
+# Play startup sound
+startup_snd = pygame.sndarray.make_sound(kits[0][1][0])
+startup_snd.set_volume(0.5)
+startup_snd.play()
 
-# --- SERIAL LISTENER THREAD ---
-def serial_thread():
-    global current_wf, wf_color, label_text, open_hat_channel
-    last_hit_time = {1: 0, 2: 0, 3: 0, 4: 0}
-    
+curr_wf, wf_col, label, active_mode = np.zeros(1000), (100,100,100), "Ready", 0
+ch_handle = None
+
+def serial_worker():
     try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.01)
-        print(f"CONNECTED to {SERIAL_PORT}")
+        print(f"Opening {SERIAL_PORT}...")
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+        print("Serial Port Open! Waiting for data...")
+        
         while True:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if ":" in line:
-                try:
-                    sid, intensity = map(int, line.split(":"))
-                    now = time.time()
-                    if (now - last_hit_time.get(sid, 0)) > 0.08:
-                        if sid in raw_sounds:
-                            raw_data, color, name = raw_sounds[sid]
-                            vol = max(0.3, (intensity / 255.0) ** 0.7)
-                            sound_obj = pygame.sndarray.make_sound(raw_data)
-                            
-                            if sid == 3: # Hi-hat choke logic
-                                if open_hat_channel: open_hat_channel.stop()
-                                sound_obj.set_volume(vol); sound_obj.play()
-                            elif sid == 4:
-                                open_hat_channel = sound_obj.play()
-                                if open_hat_channel: open_hat_channel.set_volume(vol)
-                            else:
-                                sound_obj.set_volume(vol); sound_obj.play()
+            try:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                if not line: continue
+                
+                if line.count(':') == 2:
+                    sid, intensity, mode = map(int, line.split(':'))
+                    # Send valid data to the main thread via queue
+                    sound_queue.put((sid, intensity, mode))
+                    
+            except ValueError:
+                continue 
+            except Exception as e:
+                print(f"Read Error: {e}")
+                
+    except Exception as e: 
+        print(f"CRITICAL SERIAL ERROR: {e}")
+        print("Did you forget to close the Arduino Serial Monitor?")
 
-                            current_wf = (raw_data[:1000] * vol).astype(np.int16)
-                            wf_color = color
-                            label_text = f"{name} (Vel: {intensity})"
-                            last_hit_time[sid] = now
-                except ValueError: pass
-    except Exception as e: print(f"Serial Error: {e}")
-
-threading.Thread(target=serial_thread, daemon=True).start()
+threading.Thread(target=serial_worker, daemon=True).start()
 
 # --- MAIN LOOP ---
 clock = pygame.time.Clock()
-font = pygame.font.SysFont('Arial', 24)
 
 while True:
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT: pygame.quit(); sys.exit()
+    # 1. PROCESS SERIAL EVENTS
+    while not sound_queue.empty():
+        sid, intensity, mode = sound_queue.get()
+        active_mode = mode
+        
+        if mode in kits and sid in kits[mode]:
+            data, col, name = kits[mode][sid]
+            
+            # Volume Logic
+            vol = (intensity/255.0)**0.7
+            print(f"Playing: {name} (Vol: {vol:.2f})") 
+            
+            snd = pygame.sndarray.make_sound(data)
+            snd.set_volume(vol)
+            
+            # CHOKE LOGIC: If Closed Hat (CH) plays, cut Open Hat (OH)
+            if "CH" in name and ch_handle: 
+                ch_handle.stop()
+                
+            h = snd.play()
+            
+            # Save handle if this is Open Hat, so we can cut it later
+            if "OH" in name: 
+                ch_handle = h
+            
+            curr_wf, wf_col, label = (data[:1000]*vol).astype(np.int16), col, f"KIT {mode}: {name}"
 
-    screen.fill((15, 15, 20))
-    if np.any(current_wf):
-        points = [(int(x*(WIDTH/1000)), int(HEIGHT/2 + (current_wf[x]/32767)*200)) for x in range(1000)]
-        if len(points) > 1: pygame.draw.lines(screen, wf_color, False, points, 2)
-
-    screen.blit(font.render(label_text, True, wf_color), (20, 20))
+    # 2. DRAWING
+    for e in pygame.event.get():
+        if e.type == pygame.QUIT: pygame.quit(); sys.exit()
+        
+    screen.fill((10,10,15))
+    if np.any(curr_wf):
+        pts = [(int(i*(WIDTH/1000)), int(HEIGHT/2 + (curr_wf[i]/32767)*150)) for i in range(1000)]
+        if len(pts) > 1:
+            pygame.draw.lines(screen, wf_col, False, pts, 2)
+            
+    screen.blit(font.render(label, True, wf_col), (20,20))
+    
+    # Mode Indicator
+    pygame.draw.circle(screen, (0,255,0) if active_mode==1 else (255,255,255), (WIDTH-30, 30), 10)
+    
     pygame.display.flip()
     clock.tick(60)
