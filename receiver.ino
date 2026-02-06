@@ -1,51 +1,61 @@
-#include <esp_now.h>
-#include <WiFi.h>
+#include <ESP8266WiFi.h>
+#include <espnow.h>
 
-// Data structure must match the sender
+// --- DATA STRUCTURE (Must Match Sender) ---
 typedef struct struct_message {
-  int id;
-  int intensity;
+    int id;
+    int intensity;
+    int mode;
 } struct_message;
 
 struct_message myData;
 
-// Volatile flag to safely trigger the main loop
-volatile bool newData = false;
-
-// --- THE FIX IS HERE ---
-// Old version: void onDataRecv(const uint8_t * mac, ...
-// New version: void onDataRecv(const esp_now_recv_info_t * info, ...
-void onDataRecv(const esp_now_recv_info_t * info, const uint8_t *incomingData, int len) {
-  // Verify data length to prevent corruption
-  if (len == sizeof(myData)) {
-    memcpy(&myData, incomingData, sizeof(myData));
-    newData = true; // Signal the loop to print
-  }
+// --- CALLBACK ---
+void onDataRecv(uint8_t * mac, uint8_t *incomingData, uint8_t len) {
+  memcpy(&myData, incomingData, sizeof(myData));
+  
+  // PRINT FORMAT:  ID:INTENSITY:MODE
+  Serial.print(myData.id);
+  Serial.print(":");
+  Serial.print(myData.intensity);
+  Serial.print(":");
+  Serial.println(myData.mode);
 }
 
 void setup() {
   Serial.begin(115200);
+  
+  // 1. WIFI SETUP
   WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
   
-  // Init ESP-NOW
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
-    delay(3000);
-    ESP.restart();
+  // 2. FORCE CHANNEL 1 (The Magic Fix)
+  wifi_set_channel(1); 
+
+  // 3. INIT ESP-NOW
+  if (esp_now_init() != 0) {
+    Serial.println("Init Failed");
+    return;
   }
-  
-  // Register the callback (Now compatible with v3.0)
+
+  esp_now_set_self_role(ESP_NOW_ROLE_SLAVE);
   esp_now_register_recv_cb(onDataRecv);
+
+  // 4. PRINT MAC (COPY THIS!)
+  Serial.println("--- READY ---");
+  Serial.print("MAC ADDR: {");
   
-  Serial.println("Receiver Ready. Waiting for sticks...");
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  for (int i = 0; i < 6; i++) {
+    Serial.print("0x");
+    Serial.print(mac[i], HEX);
+    if (i < 5) Serial.print(", ");
+  }
+  Serial.println("};");
+  Serial.println("COPY THE LINE ABOVE INTO YOUR ESP32 CODE");
 }
 
 void loop() {
-  // We print inside the loop to avoid crashing the callback
-  if (newData) {
-    Serial.print(myData.id);
-    Serial.print(":");
-    Serial.println(myData.intensity);
-    newData = false; 
-  }
+  yield(); // Keep watchdog happy
 }
